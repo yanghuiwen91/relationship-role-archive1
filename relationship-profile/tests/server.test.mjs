@@ -1,0 +1,22 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {spawn} from 'node:child_process';import {mkdtempSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';import {DatabaseSync} from 'node:sqlite';
+test('服务端权限、次数、恢复、幂等和后台隐私',async t=>{const dir=mkdtempSync(join(tmpdir(),'relationship-test-')),dbpath=join(dir,'db.sqlite'),port=32000+Math.floor(Math.random()*5000),origin=`http://127.0.0.1:${port}`,password='test-admin-password-long-enough',proc=spawn(process.execPath,['server.mjs'],{cwd:new URL('..',import.meta.url),env:{...process.env,PORT:String(port),HOST:'127.0.0.1',NODE_ENV:'development',ADMIN_PASSWORD:password,CODE_PEPPER:'test-pepper-with-at-least-32-characters',DB_PATH:dbpath},stdio:['ignore','pipe','pipe']});
+ t.after(()=>{proc.kill();rmSync(dir,{recursive:true,force:true})});await new Promise((resolve,reject)=>{proc.stdout.once('data',resolve);proc.once('error',reject);proc.once('exit',()=>reject(Error('server exited')))});
+ async function call(path,data,cookie){const r=await fetch(origin+'/api/'+path,{method:data===undefined?'GET':'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...(cookie?{Cookie:cookie}:{})},body:data===undefined?undefined:JSON.stringify(data)});return{status:r.status,b:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]}}
+ assert.equal((await call('admin/codes')).status,401);assert.equal((await call('verify',{code:'invalid'})).status,400);
+ const admin=(await call('admin/login',{password})).cookie;const batch=await call('admin/generate',{count:4,quota:1,days:30,label:'qa'},admin);assert.equal(batch.status,200);const codes=batch.b.codes,login=await call('verify',{code:codes[0].code}),cookie=login.cookie;assert.equal(login.b.remaining,1);
+ const key='deterministic-request-0001';const starts=await Promise.all(Array.from({length:6},()=>call('start',{key},cookie)));assert.equal(new Set(starts.map(x=>x.b.id)).size,1);assert.equal((await call('session',undefined,cookie)).b.remaining,0);let run=starts[0].b;
+ const other=await call('start',{key:'different-request-key-0002'},cookie);assert.equal(other.b.id,run.id);
+ run=(await call('save',{id:run.id,answers:[0,1],position:1,revision:run.revision},cookie)).b;assert.equal((await call('session',undefined,cookie)).b.runs[0].answers.length,2);
+ assert.equal((await call('save',{id:run.id,answers:[2],position:0,revision:0},cookie)).status,409);
+ const db=new DatabaseSync(dbpath);t.after(()=>db.close());db.prepare('UPDATE codes SET expires=? WHERE id=?').run(Date.now()-1,codes[0].id);
+ run=(await call('save',{id:run.id,answers:Array(24).fill(0),position:23,revision:run.revision},cookie)).b;
+ const submitted=await Promise.all(Array.from({length:4},()=>call('submit',{id:run.id,revision:run.revision},cookie)));assert.ok(submitted.every(r=>r.status===200));assert.deepEqual(submitted[0].b.report,submitted[3].b.report);
+ assert.equal((await call('verify',{code:codes[0].code})).status,200);assert.equal((await call('start',{key:'new-request-after-complete'},cookie)).status,403);
+ db.prepare('UPDATE codes SET expires=? WHERE id=?').run(Date.now()+86400000,codes[0].id);assert.match((await call('start',{key:'another-request-after-complete'},cookie)).b.error,/次数/);
+ const logs=await call('admin/codes',undefined,admin);assert.equal(logs.b.events.filter(e=>e.kind==='started'&&e.code_id===codes[0].id).length,1);assert.equal(logs.b.events.filter(e=>e.kind==='completed'&&e.code_id===codes[0].id).length,1);assert.ok(!JSON.stringify(logs.b).includes('answers'));assert.ok(!JSON.stringify(logs.b).includes(codes[0].code));
+ await call('admin/disable',{id:codes[0].id,disabled:true},admin);assert.equal((await call('session',undefined,cookie)).status,403);assert.match((await call('verify',{code:codes[0].code})).b.error,/停用/);
+ db.prepare('UPDATE codes SET expires=? WHERE id=?').run(Date.now()-1,codes[1].id);assert.match((await call('verify',{code:codes[1].code})).b.error,/过期/);
+ const otherCookie=(await call('verify',{code:codes[2].code})).cookie;assert.equal((await call('submit',{id:run.id,revision:run.revision},otherCookie)).status,404);
+ const cross=await fetch(origin+'/api/start',{method:'POST',headers:{'Content-Type':'application/json',Origin:'https://evil.example',Cookie:otherCookie},body:JSON.stringify({key:'cross-site-attempt-0000'})});assert.equal(cross.status,403);
+ for(let i=0;i<13;i++)await call('verify',{code:'wrong'});assert.equal((await call('verify',{code:'wrong'})).status,429);
+});
